@@ -1,0 +1,18 @@
+{
+  "active_contributors": 438,
+  "ai_signals": {
+    "repos_checked": 10,
+    "repos_with_signal": 3,
+    "signals": {
+      "AGENTS.md": 3,
+      "CLAUDE.md": 1,
+      "Copilot instructions": 0,
+      "Cursor": 0,
+      "Warp": 0
+    }
+  },
+  "count_limits": [],
+  "login": "netflix",
+  "prs_opened_30d": 369,
+  "scoped_repos": 184
+}

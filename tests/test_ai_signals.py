@@ -111,10 +111,17 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(out["repos_checked"], 10)
         self.assertEqual(out["signals"]["AGENTS.md"], 10)
 
+    def test_repos_with_signal_counts_each_repo_once(self):
+        repos = [repo(n) for n in "abc"]
+        present = {"a": files("CLAUDE.md", "AGENTS.md"), "b": files("AGENTS.md"), "c": {}}
+        out = prospect.get_ai_signals(fake_session(present), repos)
+        self.assertEqual(out["repos_with_signal"], 2)
+
     def test_zero_and_fewer_repos(self):
         s = fake_session()
         zero = prospect.get_ai_signals(s, [])
         self.assertEqual(zero["repos_checked"], 0)
+        self.assertEqual(zero["repos_with_signal"], 0)
         self.assertEqual(sum(zero["signals"].values()), 0)
         s.get.assert_not_called()
         one = prospect.get_ai_signals(s, [repo("a")])
@@ -171,7 +178,7 @@ class ReportTests(unittest.TestCase):
 
     def test_lists_found_signals_with_counts(self):
         signals = {"CLAUDE.md": 3, "AGENTS.md": 0, "Cursor": 1}
-        ai = {"repos_checked": 10, "signals": signals}
+        ai = {"repos_checked": 10, "repos_with_signal": 4, "signals": signals}
         out = self.render(ai)
         self.assertIn("AI coding tool signals (top 10 repos):", out)
         self.assertIn("CLAUDE.md: 3 of 10 repos", out)
@@ -179,7 +186,8 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("AGENTS.md: 0", out)
 
     def test_none_found(self):
-        out = self.render({"repos_checked": 4, "signals": {"CLAUDE.md": 0}})
+        out = self.render({"repos_checked": 4, "repos_with_signal": 0,
+                           "signals": {"CLAUDE.md": 0}})
         self.assertIn("none found", out)
 
     def test_existing_metrics_unchanged_without_signals(self):

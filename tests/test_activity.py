@@ -1,13 +1,16 @@
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 import prospect
 
 NOW = datetime(2026, 1, 31, tzinfo=timezone.utc)
 CUTOFF = NOW - timedelta(days=30)
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def resp(data, status=200):
@@ -203,15 +206,14 @@ class SummaryAndReportTests(unittest.TestCase):
         self.assertIn("WARNING: PR search stayed incomplete.", buf.getvalue())
 
 
-def stats(prs=0, contributors=0, tools=0, repos=1, limits=None):
-    names = ["CLAUDE.md", "AGENTS.md", "Cursor", "Warp"]
-    signals = {n: (3 if i < tools else 0) for i, n in enumerate(names)}
+def stats(prs=0, contributors=0, ai_repos=0, repos=1, limits=None):
     return {
         "prs_opened_30d": prs,
         "active_contributors": contributors,
         "scoped_repos": repos,
         "count_limits": limits or [],
-        "ai_signals": {"repos_checked": 10, "signals": signals},
+        "ai_signals": {"repos_checked": 10, "repos_with_signal": ai_repos,
+                       "signals": {"AGENTS.md": ai_repos}},
     }
 
 
@@ -225,21 +227,22 @@ class FitScoreTests(unittest.TestCase):
         self.assertIn("not enough public data", reason)
 
     def test_strong_fit_is_ten(self):
-        score, reason = prospect.fit_score(stats(prs=200, contributors=80, tools=3))
+        score, reason = prospect.fit_score(
+            stats(prs=500, contributors=80, ai_repos=3, repos=50))
         self.assertEqual(score, 10)
         self.assertIn("active engineering org with AI signals", reason)
 
     def test_missing_dimension_is_not_strong_fit(self):
-        for kw in (dict(prs=50, contributors=1, tools=2),
-                   dict(prs=0, contributors=80, tools=3),
-                   dict(prs=200, contributors=80, tools=0)):
+        for kw in (dict(prs=200, contributors=1, ai_repos=3),
+                   dict(prs=0, contributors=80, ai_repos=3),
+                   dict(prs=200, contributors=80, ai_repos=0)):
             score, reason = prospect.fit_score(stats(**kw))
             self.assertLessEqual(score, 7, kw)
             self.assertNotIn("active engineering org", reason, kw)
 
-    def test_one_ai_signal_without_activity_is_not_enough_data(self):
-        score, reason = prospect.fit_score(stats(tools=1))
-        self.assertEqual(score, 3)
+    def test_one_ai_repo_without_activity_is_not_enough_data(self):
+        score, reason = prospect.fit_score(stats(ai_repos=1))
+        self.assertEqual(score, 2)
         self.assertIn("not enough public data", reason)
 
     def test_any_activity_evidence_is_enough_data(self):
@@ -247,55 +250,68 @@ class FitScoreTests(unittest.TestCase):
             self.assertNotIn("not enough public data",
                              prospect.fit_score(stats(**kw))[1])
 
-    def test_reason_counts_signal_categories_not_tools(self):
-        signals = {"CLAUDE.md": 2, "AGENTS.md": 1, "Cursor": 0}
-        sm = dict(stats(prs=5), ai_signals={"repos_checked": 3, "signals": signals})
-        reason = prospect.fit_score(sm)[1]
-        self.assertIn("2 AI signal categories", reason)
-        self.assertNotIn("tools", reason)
-        self.assertIn("1 AI signal category", prospect.fit_score(stats(prs=5, tools=1))[1])
+    def test_reason_reports_ai_repo_coverage(self):
+        reason = prospect.fit_score(stats(prs=5, ai_repos=2))[1]
+        self.assertIn("AI signals in 2 of 10 sampled repos", reason)
 
-    def test_pr_tier_boundaries(self):
-        self.assertEqual([self.score(prs=n) for n in (0, 1, 4, 5, 19, 20, 49, 50)],
-                         [1, 2, 2, 3, 3, 4, 4, 5])
+    def test_pr_volume_tier_boundaries(self):
+        self.assertEqual([self.score(prs=n) for n in (0, 1, 9, 10, 49, 50, 99, 100, 199, 200)],
+                         [1, 2, 2, 3, 3, 4, 4, 5, 5, 6])
 
     def test_contributor_tier_boundaries(self):
-        self.assertEqual([self.score(prs=5, contributors=n) for n in (4, 5, 19, 20)],
-                         [3, 4, 4, 5])
+        self.assertEqual([self.score(prs=5, contributors=n) for n in (19, 20)],
+                         [2, 3])
 
     def test_contributors_without_recent_prs_score_nothing(self):
         self.assertEqual(self.score(contributors=500), 1)
 
+    def test_ai_coverage_tier_boundaries(self):
+        self.assertEqual([self.score(prs=5, ai_repos=n) for n in range(0, 5)],
+                         [2, 3, 4, 5, 5])
+
+    def test_missing_contributors_cap_is_seven_without_strong_wording(self):
+        score, reason = prospect.fit_score(stats(prs=200, contributors=1, ai_repos=3))
+        self.assertEqual(score, 7)
+        self.assertNotIn("active engineering org", reason)
+
+    def test_ai_points_use_sample_percentage_not_repo_count(self):
+        warp = dict(prs=543, contributors=191, repos=52)
+        cases = [(1, 10, 8), (1, 5, 9), (1, 2, 10), (0, 0, 7)]
+        for with_signal, checked, expected in cases:
+            sm = stats(**warp)
+            sm["ai_signals"] = {"repos_checked": checked,
+                                "repos_with_signal": with_signal, "signals": {}}
+            self.assertEqual(prospect.fit_score(sm)[0], expected,
+                             (with_signal, checked))
+
+    def test_ai_points_follow_repo_coverage_not_category_count(self):
+        one = prospect.fit_score(stats(prs=5, ai_repos=1))
+        ten = prospect.fit_score(stats(prs=5, ai_repos=10))
+        self.assertLess(one[0], ten[0])
+
     def test_large_sparse_org_scores_low_without_strong_wording(self):
         for prs in (0, 5, 40):
             score, reason = prospect.fit_score(
-                stats(prs=prs, contributors=80, tools=2, repos=1000))
+                stats(prs=prs, contributors=80, ai_repos=3, repos=1000))
             self.assertLessEqual(score, 4, prs)
             self.assertIn("low recent PR activity relative to org size", reason)
             self.assertNotIn("active engineering org", reason)
             self.assertIn("across 1000 non-archived repos", reason)
 
-    def test_small_active_org_scores_as_strong_fit(self):
-        score, reason = prospect.fit_score(
-            stats(prs=50, contributors=30, tools=2, repos=10))
-        self.assertEqual(score, 10)
-        self.assertIn("active engineering org with AI signals", reason)
-        self.assertIn("5.00 per repo", reason)
-
-    def test_same_prs_score_lower_in_larger_org(self):
-        scores = [self.score(prs=50, contributors=30, tools=2, repos=n)
-                  for n in (10, 100, 250, 1000, 5000)]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-        self.assertGreater(scores[0], scores[-1])
+    def test_density_separates_orgs_with_equal_volume(self):
+        densities = (0.3, 1.0, 2.0, 4.0, 20.0)
+        scores = [self.score(prs=int(d * 1000), contributors=80, ai_repos=3, repos=1000)
+                  for d in densities]
+        self.assertEqual(scores, [6, 7, 8, 9, 10])
 
     def test_density_tier_boundaries(self):
-        self.assertEqual([self.score(prs=50, repos=n) for n in (50, 100, 250, 1000, 1001)],
-                         [5, 4, 3, 2, 1])
+        self.assertEqual([self.score(prs=200, repos=n) for n in (25, 26, 50, 100, 400, 1000, 1001)],
+                         [6, 5, 5, 4, 3, 2, 1])
 
     def test_unreliable_counts_withhold_definitive_score(self):
         for repos in (10, 1000):
             score, reason = prospect.fit_score(stats(
-                prs=50, contributors=30, tools=2, repos=repos,
+                prs=50, contributors=30, ai_repos=3, repos=repos,
                 limits=["repo search stayed incomplete, so the repo count may be low"]))
             self.assertLessEqual(score, prospect.PROVISIONAL_MAX_SCORE)
             self.assertIn("provisional", reason)
@@ -305,9 +321,9 @@ class FitScoreTests(unittest.TestCase):
         self.assertIn(self.score(prs=5, repos=0), range(1, 11))
 
     def test_score_never_decreases_with_more_evidence(self):
-        for field in ("prs", "contributors", "tools"):
+        for field in ("prs", "contributors", "ai_repos"):
             scores = [self.score(**{field: n}) for n in range(0, 100)
-                      if field != "tools" or n <= 4]
+                      if field != "ai_repos" or n <= 10]
             self.assertEqual(scores, sorted(scores), field)
 
     def test_popularity_does_not_change_score(self):
@@ -317,9 +333,20 @@ class FitScoreTests(unittest.TestCase):
 
     def test_scores_stay_within_one_to_ten(self):
         for prs in (0, 10, 10000):
-            for tools in (0, 4):
-                self.assertIn(self.score(prs=prs, contributors=500, tools=tools),
+            for ai_repos in (0, 10):
+                self.assertIn(self.score(prs=prs, contributors=500, ai_repos=ai_repos),
                               range(1, 11))
+
+    def test_frozen_live_orgs_spread_with_warp_first(self):
+        scores = {}
+        for org in ("warpdotdev", "uber", "netflix", "dropbox", "yahoo"):
+            with open(FIXTURES / f"{org}.json") as f:
+                scores[org] = prospect.fit_score(json.load(f))[0]
+        self.assertEqual(scores["warpdotdev"], 10)
+        self.assertEqual([o for o, s in scores.items() if s == 10], ["warpdotdev"])
+        self.assertEqual(max(scores, key=scores.get), "warpdotdev")
+        self.assertGreaterEqual(max(scores.values()) - min(scores.values()), 5)
+        self.assertIn(scores["yahoo"], (4, 5))
 
     def test_report_ends_with_fit_line(self):
         sm = prospect.summarize(self.ORG, [], {"active_contributors": 0})

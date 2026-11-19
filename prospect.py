@@ -171,16 +171,21 @@ def has_signal_path(s, repo, root, kind, path):
 
 
 def get_ai_signals(s, repos):
-    """Per-signal count of top repos by recent push that contain the signal."""
+    """Per-signal repo counts, and the distinct top repos with any signal."""
     top = repos[:TOP_REPOS]
     counts = {name: 0 for name in AI_SIGNALS}
+    with_signal = 0
     for repo in top:
         root = list_entry_types(s, repo)
+        found = False
         for name, paths in AI_SIGNALS.items():
             if any(has_signal_path(s, repo, root, kind, p)
                    for kind, p in paths):
                 counts[name] += 1
-    return {"repos_checked": len(top), "signals": counts}
+                found = True
+        with_signal += found
+    return {"repos_checked": len(top), "repos_with_signal": with_signal,
+            "signals": counts}
 
 
 def parse_time(value):
@@ -196,7 +201,8 @@ def summarize(org_info, repos, activity=None, ai_signals=None):
     ]
     languages = Counter(r["language"] for r in active if r.get("language"))
     activity = activity or {}
-    ai_signals = ai_signals or {"repos_checked": 0, "signals": {}}
+    ai_signals = ai_signals or {"repos_checked": 0, "repos_with_signal": 0,
+                                "signals": {}}
     return {
         "name": org_info.get("name") or org_info["login"],
         "login": org_info["login"],
@@ -224,9 +230,9 @@ def fit_score(sm):
     contributors = sm["active_contributors"]
     repos = max(sm["scoped_repos"], 1)
     prs_per_repo = prs / repos
-    # Signal categories are file conventions (for example the tool-neutral
-    # AGENTS.md), not a count of distinct tools.
-    signals = sum(1 for c in sm["ai_signals"]["signals"].values() if c)
+    ai = sm["ai_signals"]
+    ai_repos = ai["repos_with_signal"]
+    ai_coverage = ai_repos / max(ai["repos_checked"], 1)
 
     # Weights: 1 (floor) + up to 9 points of evidence. Each tier list holds
     # (minimum value, points), highest tier first. Org popularity (followers,
@@ -235,22 +241,24 @@ def fit_score(sm):
     # Recent PRs weigh the most: they show a team shipping code now. Points are
     # the lower of two readings: PR volume (a one-repo org with one PR is not
     # a team) and PRs per in-scope repo in 30d (a huge org with a trickle of
-    # PRs is mostly dormant).
-    pr_tiers = [(50, 4), (20, 3), (5, 2), (1, 1)]
-    density_tiers = [(1.0, 4), (0.5, 3), (0.2, 2), (0.05, 1)]
+    # PRs is mostly dormant). The top density tier is for orgs where every
+    # repo sees heavy review traffic.
+    pr_tiers = [(200, 5), (100, 4), (50, 3), (10, 2), (1, 1)]
+    density_tiers = [(8.0, 5), (4.0, 4), (1.5, 3), (0.5, 2), (0.2, 1)]
     # Contributor breadth shows a team, not a solo maintainer. It is all-time,
-    # so it counts only when recent PRs score, and weighs less than them.
-    contributor_tiers = [(20, 2), (5, 1)]
-    # Detected AI signal categories in public repos: one is a clear sign of use
-    # and a second adds a little more. More files add no more proof.
-    ai_tiers = [(2, 3), (1, 2)]
+    # so it counts only when recent PRs score.
+    contributor_tiers = [(20, 1)]
+    # AI points follow how many of the sampled repos carry any AI signal file,
+    # not how many file conventions exist: adoption across repos shows a
+    # practice, one repo shows an experiment.
+    ai_tiers = [(0.3, 3), (0.2, 2), (0.01, 1)]
 
     def points(value, tiers):
         return next((p for minimum, p in tiers if value >= minimum), 0)
 
     pr_points = min(points(prs, pr_tiers), points(prs_per_repo, density_tiers))
     contributor_points = points(contributors, contributor_tiers) if pr_points else 0
-    ai_points = points(signals, ai_tiers)
+    ai_points = points(ai_coverage, ai_tiers)
     score = 1 + pr_points + contributor_points + ai_points
 
     # A strong fit needs evidence in all three dimensions. Without it the score
@@ -259,10 +267,9 @@ def fit_score(sm):
     if not strong:
         score = min(score, 7)
 
-    plural = "y" if signals == 1 else "ies"
     facts = (f"{prs} PRs in 30d across {sm['scoped_repos']} non-archived "
              f"repos ({prs_per_repo:.2f} per repo), {contributors} contributors, "
-             f"{signals} AI signal categor{plural} in public repos")
+             f"AI signals in {ai_repos} of {ai['repos_checked']} sampled repos")
     # Sufficiency depends on activity evidence only: AI files alone cannot show
     # an active engineering org.
     if sm["count_limits"]:
@@ -298,6 +305,7 @@ def print_report(sm):
             print(f"  {name}: {count} of {ai['repos_checked']} repos")
     else:
         print("  none found")
+    print(f"  Repos with any signal: {ai['repos_with_signal']} of {ai['repos_checked']}")
     print("Data limits: PRs and non-archived repos (public, forks included) are")
     print(f"  org-wide; contributors and AI signals sample the {TOP_REPOS} most recently")
     print("  pushed non-fork, non-archived repos. Private repos are not visible.")
