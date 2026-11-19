@@ -20,3 +20,4 @@ python prospect.py vercel
 - Top languages across active repos
 - Active contributors: unique all-time contributors across the org's 10 most recently pushed public repos
 - PRs opened last 30d (any state) across those same repos
+- AI coding tool signals: how many of those same repos contain `CLAUDE.md`, `AGENTS.md`, `.cursor/` or `.cursorrules`, `.github/copilot-instructions.md`, or `.warp/` at the root of the default branch. Missing files are not errors.

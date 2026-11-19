@@ -19,6 +19,13 @@ API = "https://api.github.com"
 PAGE_SIZE = 100
 TOP_REPOS = 10
 PR_WINDOW_DAYS = 30
+AI_SIGNALS = {
+    "CLAUDE.md": ["CLAUDE.md"],
+    "AGENTS.md": ["AGENTS.md"],
+    "Cursor": [".cursor", ".cursorrules"],
+    "Copilot instructions": [".github/copilot-instructions.md"],
+    "Warp": [".warp"],
+}
 
 
 def session():
@@ -104,11 +111,31 @@ def get_activity(s, repos, cutoff):
     return {"active_contributors": len(contributors), "prs_opened_30d": prs}
 
 
+def path_exists(s, repo, path):
+    """True if path exists at the root of the default branch; 404 means absent."""
+    r = s.get(f"{API}/repos/{repo['full_name']}/contents/{path}", timeout=15)
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+    return True
+
+
+def get_ai_signals(s, repos):
+    """Repos, among the top repos by recent push, that contain each AI tool signal."""
+    top = repos[:TOP_REPOS]
+    counts = {name: 0 for name in AI_SIGNALS}
+    for repo in top:
+        for name, paths in AI_SIGNALS.items():
+            if any(path_exists(s, repo, p) for p in paths):
+                counts[name] += 1
+    return {"repos_checked": len(top), "signals": counts}
+
+
 def parse_time(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def summarize(org_info, repos, activity=None):
+def summarize(org_info, repos, activity=None, ai_signals=None):
     cutoff = datetime.now(timezone.utc) - timedelta(days=90)
     active = [
         r for r in repos
@@ -117,6 +144,7 @@ def summarize(org_info, repos, activity=None):
     ]
     languages = Counter(r["language"] for r in active if r.get("language"))
     activity = activity or {}
+    ai_signals = ai_signals or {"repos_checked": 0, "signals": {}}
     return {
         "name": org_info.get("name") or org_info["login"],
         "login": org_info["login"],
@@ -127,6 +155,7 @@ def summarize(org_info, repos, activity=None):
         "top_languages": languages.most_common(5),
         "active_contributors": activity.get("active_contributors", 0),
         "prs_opened_30d": activity.get("prs_opened_30d", 0),
+        "ai_signals": ai_signals,
     }
 
 
@@ -140,7 +169,16 @@ def print_report(sm):
     print(f"Active contributors:     {sm['active_contributors']}")
     print(f"PRs opened last 30d:     {sm['prs_opened_30d']}")
     langs = ", ".join(f"{l} ({n})" for l, n in sm["top_languages"]) or "n/a"
-    print(f"Top languages (active):  {langs}\n")
+    print(f"Top languages (active):  {langs}")
+    ai = sm["ai_signals"]
+    found = [(n, c) for n, c in ai["signals"].items() if c]
+    print(f"AI coding tool signals (top {ai['repos_checked']} repos):")
+    if found:
+        for name, count in found:
+            print(f"  {name}: {count} of {ai['repos_checked']} repos")
+    else:
+        print("  none found")
+    print()
 
 
 def main():
@@ -154,10 +192,11 @@ def main():
         repos = get_recent_repos(s, org)
         pr_cutoff = datetime.now(timezone.utc) - timedelta(days=PR_WINDOW_DAYS)
         activity = get_activity(s, repos, pr_cutoff)
+        ai_signals = get_ai_signals(s, repos)
     except requests.HTTPError as e:
         print(f"GitHub error for '{org}': {e}")
         sys.exit(2)
-    print_report(summarize(org_info, repos, activity))
+    print_report(summarize(org_info, repos, activity, ai_signals))
 
 
 if __name__ == "__main__":
