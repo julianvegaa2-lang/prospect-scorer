@@ -135,5 +135,91 @@ class SummaryAndReportTests(unittest.TestCase):
         self.assertIn("PRs opened last 30d:     0", out)
 
 
+def stats(prs=0, contributors=0, tools=0):
+    names = ["CLAUDE.md", "AGENTS.md", "Cursor", "Warp"]
+    signals = {n: (3 if i < tools else 0) for i, n in enumerate(names)}
+    return {
+        "prs_opened_30d": prs,
+        "active_contributors": contributors,
+        "ai_signals": {"repos_checked": 10, "signals": signals},
+    }
+
+
+class FitScoreTests(unittest.TestCase):
+    def score(self, **kw):
+        return prospect.fit_score(stats(**kw))[0]
+
+    def test_no_data_is_lowest_score_with_not_enough_data_reason(self):
+        score, reason = prospect.fit_score(stats())
+        self.assertEqual(score, 1)
+        self.assertIn("not enough public data", reason)
+
+    def test_strong_fit_is_ten(self):
+        score, reason = prospect.fit_score(stats(prs=200, contributors=80, tools=3))
+        self.assertEqual(score, 10)
+        self.assertIn("active engineering org with AI signals", reason)
+
+    def test_missing_dimension_is_not_strong_fit(self):
+        for kw in (dict(prs=50, contributors=1, tools=2),
+                   dict(prs=0, contributors=80, tools=3),
+                   dict(prs=200, contributors=80, tools=0)):
+            score, reason = prospect.fit_score(stats(**kw))
+            self.assertLessEqual(score, 7, kw)
+            self.assertNotIn("active engineering org", reason, kw)
+
+    def test_one_ai_signal_without_activity_is_not_enough_data(self):
+        score, reason = prospect.fit_score(stats(tools=1))
+        self.assertEqual(score, 3)
+        self.assertIn("not enough public data", reason)
+
+    def test_any_activity_evidence_is_enough_data(self):
+        for kw in (dict(prs=1), dict(contributors=5)):
+            self.assertNotIn("not enough public data",
+                             prospect.fit_score(stats(**kw))[1])
+
+    def test_reason_counts_signal_categories_not_tools(self):
+        signals = {"CLAUDE.md": 2, "AGENTS.md": 1, "Cursor": 0}
+        sm = dict(stats(prs=5), ai_signals={"repos_checked": 3, "signals": signals})
+        reason = prospect.fit_score(sm)[1]
+        self.assertIn("2 AI signal categories", reason)
+        self.assertNotIn("tools", reason)
+        self.assertIn("1 AI signal category", prospect.fit_score(stats(prs=5, tools=1))[1])
+
+    def test_pr_tier_boundaries(self):
+        self.assertEqual([self.score(prs=n) for n in (0, 1, 4, 5, 19, 20, 49, 50)],
+                         [1, 2, 2, 3, 3, 4, 4, 5])
+
+    def test_contributor_tier_boundaries(self):
+        self.assertEqual([self.score(contributors=n) for n in (4, 5, 19, 20)],
+                         [1, 2, 2, 3])
+
+    def test_score_never_decreases_with_more_evidence(self):
+        for field in ("prs", "contributors", "tools"):
+            scores = [self.score(**{field: n}) for n in range(0, 100)
+                      if field != "tools" or n <= 4]
+            self.assertEqual(scores, sorted(scores), field)
+
+    def test_popularity_does_not_change_score(self):
+        sm = stats(prs=5)
+        big = dict(sm, followers=100000, stars_on_active=100000, public_repos=900)
+        self.assertEqual(prospect.fit_score(big), prospect.fit_score(sm))
+
+    def test_scores_stay_within_one_to_ten(self):
+        for prs in (0, 10, 10000):
+            for tools in (0, 4):
+                self.assertIn(self.score(prs=prs, contributors=500, tools=tools),
+                              range(1, 11))
+
+    def test_report_ends_with_fit_line(self):
+        sm = prospect.summarize(self.ORG, [], {"active_contributors": 0, "prs_opened_30d": 0})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            prospect.print_report(sm)
+        last = buf.getvalue().rstrip("\n").splitlines()[-1]
+        self.assertRegex(last, r"^Fit: \d+/10 \(not enough public data.*\)$")
+
+    ORG = {"login": "org", "public_repos": 0, "followers": 0}
+
+
 if __name__ == "__main__":
     unittest.main()

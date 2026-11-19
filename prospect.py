@@ -178,6 +178,58 @@ def summarize(org_info, repos, activity=None, ai_signals=None):
     }
 
 
+def fit_score(sm):
+    """Return (score from 1 to 10, one-line reason) for Warp Factories fit.
+
+    All scoring rules live here. Public data is only a partial view: a private
+    engineering team and missing AI files are not proof of no fit, so a score
+    without public activity evidence says "not enough public data".
+    """
+    prs = sm["prs_opened_30d"]
+    contributors = sm["active_contributors"]
+    # Signal categories are file conventions (for example the tool-neutral
+    # AGENTS.md), not a count of distinct tools.
+    signals = sum(1 for c in sm["ai_signals"]["signals"].values() if c)
+
+    # Weights: 1 (floor) + up to 9 points of evidence. Each tier list holds
+    # (minimum value, points), highest tier first. Org popularity (followers,
+    # stars, repo count) is deliberately not scored.
+    #
+    # Recent PRs weigh the most: they show a team shipping code now.
+    pr_tiers = [(50, 4), (20, 3), (5, 2), (1, 1)]
+    # Contributor breadth shows a team, not a solo maintainer. It is all-time,
+    # so it weighs less than recent PRs.
+    contributor_tiers = [(20, 2), (5, 1)]
+    # Detected AI signal categories in public repos: one is a clear sign of use
+    # and a second adds a little more. More files add no more proof.
+    ai_tiers = [(2, 3), (1, 2)]
+
+    def points(value, tiers):
+        return next((p for minimum, p in tiers if value >= minimum), 0)
+
+    pr_points = points(prs, pr_tiers)
+    contributor_points = points(contributors, contributor_tiers)
+    ai_points = points(signals, ai_tiers)
+    score = 1 + pr_points + contributor_points + ai_points
+
+    # A strong fit needs evidence in all three dimensions. Without it the score
+    # is capped at 7 so strong-fit language is never used on partial evidence.
+    strong = bool(pr_points and contributor_points and ai_points)
+    if not strong:
+        score = min(score, 7)
+
+    plural = "y" if signals == 1 else "ies"
+    facts = (f"{prs} PRs in 30d, {contributors} contributors, "
+             f"{signals} AI signal categor{plural} in public repos")
+    # Sufficiency depends on activity evidence only: AI files alone cannot show
+    # an active engineering org.
+    if not pr_points and not contributor_points:
+        return score, f"not enough public data to judge ({facts})"
+    if strong and score >= 8:
+        return score, f"active engineering org with AI signals ({facts})"
+    return score, facts
+
+
 def print_report(sm):
     print(f"\n{sm['name']} (github.com/{sm['login']})")
     print("-" * 40)
@@ -197,7 +249,9 @@ def print_report(sm):
             print(f"  {name}: {count} of {ai['repos_checked']} repos")
     else:
         print("  none found")
+    score, reason = fit_score(sm)
     print()
+    print(f"Fit: {score}/10 ({reason})")
 
 
 def main():
