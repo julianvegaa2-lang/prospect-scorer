@@ -135,5 +135,65 @@ class SummaryAndReportTests(unittest.TestCase):
         self.assertIn("PRs opened last 30d:     0", out)
 
 
+def stats(prs=0, contributors=0, tools=0):
+    names = ["CLAUDE.md", "AGENTS.md", "Cursor", "Warp"]
+    signals = {n: (3 if i < tools else 0) for i, n in enumerate(names)}
+    return {
+        "prs_opened_30d": prs,
+        "active_contributors": contributors,
+        "ai_signals": {"repos_checked": 10, "signals": signals},
+    }
+
+
+class FitScoreTests(unittest.TestCase):
+    def score(self, **kw):
+        return prospect.fit_score(stats(**kw))[0]
+
+    def test_no_data_is_lowest_score_with_not_enough_data_reason(self):
+        score, reason = prospect.fit_score(stats())
+        self.assertEqual(score, 1)
+        self.assertIn("not enough public data", reason)
+
+    def test_strong_fit_is_ten(self):
+        score, reason = prospect.fit_score(stats(prs=200, contributors=80, tools=3))
+        self.assertEqual(score, 10)
+        self.assertIn("already using AI tools", reason)
+
+    def test_pr_tier_boundaries(self):
+        self.assertEqual([self.score(prs=n) for n in (0, 1, 4, 5, 19, 20, 49, 50)],
+                         [1, 2, 2, 3, 3, 4, 4, 5])
+
+    def test_contributor_tier_boundaries(self):
+        self.assertEqual([self.score(contributors=n) for n in (4, 5, 19, 20)],
+                         [1, 2, 2, 3])
+
+    def test_score_never_decreases_with_more_evidence(self):
+        for field in ("prs", "contributors", "tools"):
+            scores = [self.score(**{field: n}) for n in range(0, 100)
+                      if field != "tools" or n <= 4]
+            self.assertEqual(scores, sorted(scores), field)
+
+    def test_popularity_does_not_change_score(self):
+        sm = stats(prs=5)
+        big = dict(sm, followers=100000, stars_on_active=100000, public_repos=900)
+        self.assertEqual(prospect.fit_score(big), prospect.fit_score(sm))
+
+    def test_scores_stay_within_one_to_ten(self):
+        for prs in (0, 10, 10000):
+            for tools in (0, 4):
+                self.assertIn(self.score(prs=prs, contributors=500, tools=tools),
+                              range(1, 11))
+
+    def test_report_ends_with_fit_line(self):
+        sm = prospect.summarize(self.ORG, [], {"active_contributors": 0, "prs_opened_30d": 0})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            prospect.print_report(sm)
+        last = buf.getvalue().rstrip("\n").splitlines()[-1]
+        self.assertRegex(last, r"^Fit: \d+/10 \(not enough public data.*\)$")
+
+    ORG = {"login": "org", "public_repos": 0, "followers": 0}
+
+
 if __name__ == "__main__":
     unittest.main()
