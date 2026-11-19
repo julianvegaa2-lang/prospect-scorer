@@ -18,3 +18,5 @@ python prospect.py vercel
 - Repos pushed in the last 90 days
 - Stars on those active repos
 - Top languages across active repos
+- Active contributors: unique all-time contributors across the org's 10 most recently pushed public repos
+- PRs opened last 30d (any state) across those same repos
