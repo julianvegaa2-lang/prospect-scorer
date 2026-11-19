@@ -1,0 +1,18 @@
+{
+  "active_contributors": 102,
+  "ai_signals": {
+    "repos_checked": 10,
+    "repos_with_signal": 2,
+    "signals": {
+      "AGENTS.md": 2,
+      "CLAUDE.md": 1,
+      "Copilot instructions": 0,
+      "Cursor": 0,
+      "Warp": 0
+    }
+  },
+  "count_limits": [],
+  "login": "yahoo",
+  "prs_opened_30d": 38,
+  "scoped_repos": 124
+}

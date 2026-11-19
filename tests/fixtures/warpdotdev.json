@@ -1,0 +1,18 @@
+{
+  "active_contributors": 191,
+  "ai_signals": {
+    "repos_checked": 10,
+    "repos_with_signal": 3,
+    "signals": {
+      "AGENTS.md": 3,
+      "CLAUDE.md": 0,
+      "Copilot instructions": 0,
+      "Cursor": 0,
+      "Warp": 2
+    }
+  },
+  "count_limits": [],
+  "login": "warpdotdev",
+  "prs_opened_30d": 543,
+  "scoped_repos": 52
+}
