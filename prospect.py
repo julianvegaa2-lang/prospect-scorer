@@ -182,12 +182,14 @@ def fit_score(sm):
     """Return (score from 1 to 10, one-line reason) for Warp Factories fit.
 
     All scoring rules live here. Public data is only a partial view: a private
-    engineering team and missing AI files are not proof of no fit, so a low
-    score with little evidence says "not enough public data".
+    engineering team and missing AI files are not proof of no fit, so a score
+    without public activity evidence says "not enough public data".
     """
     prs = sm["prs_opened_30d"]
     contributors = sm["active_contributors"]
-    tools = sum(1 for c in sm["ai_signals"]["signals"].values() if c)
+    # Signal categories are file conventions (for example the tool-neutral
+    # AGENTS.md), not a count of distinct tools.
+    signals = sum(1 for c in sm["ai_signals"]["signals"].values() if c)
 
     # Weights: 1 (floor) + up to 9 points of evidence. Each tier list holds
     # (minimum value, points), highest tier first. Org popularity (followers,
@@ -198,26 +200,33 @@ def fit_score(sm):
     # Contributor breadth shows a team, not a solo maintainer. It is all-time,
     # so it weighs less than recent PRs.
     contributor_tiers = [(20, 2), (5, 1)]
-    # Distinct AI tools with public files: one tool is a clear sign of use and
-    # a second adds a little more. More files add no more proof.
+    # Detected AI signal categories in public repos: one is a clear sign of use
+    # and a second adds a little more. More files add no more proof.
     ai_tiers = [(2, 3), (1, 2)]
 
     def points(value, tiers):
         return next((p for minimum, p in tiers if value >= minimum), 0)
 
-    score = 1 + (
-        points(prs, pr_tiers)
-        + points(contributors, contributor_tiers)
-        + points(tools, ai_tiers)
-    )
+    pr_points = points(prs, pr_tiers)
+    contributor_points = points(contributors, contributor_tiers)
+    ai_points = points(signals, ai_tiers)
+    score = 1 + pr_points + contributor_points + ai_points
 
-    plural = "s" if tools != 1 else ""
+    # A strong fit needs evidence in all three dimensions. Without it the score
+    # is capped at 7 so strong-fit language is never used on partial evidence.
+    strong = bool(pr_points and contributor_points and ai_points)
+    if not strong:
+        score = min(score, 7)
+
+    plural = "y" if signals == 1 else "ies"
     facts = (f"{prs} PRs in 30d, {contributors} contributors, "
-             f"{tools} AI coding tool{plural} in public repos")
-    if score <= 3 and tools == 0:
+             f"{signals} AI signal categor{plural} in public repos")
+    # Sufficiency depends on activity evidence only: AI files alone cannot show
+    # an active engineering org.
+    if not pr_points and not contributor_points:
         return score, f"not enough public data to judge ({facts})"
-    if score >= 8:
-        return score, f"active engineering org already using AI tools ({facts})"
+    if strong and score >= 8:
+        return score, f"active engineering org with AI signals ({facts})"
     return score, facts
 
 

@@ -157,7 +157,33 @@ class FitScoreTests(unittest.TestCase):
     def test_strong_fit_is_ten(self):
         score, reason = prospect.fit_score(stats(prs=200, contributors=80, tools=3))
         self.assertEqual(score, 10)
-        self.assertIn("already using AI tools", reason)
+        self.assertIn("active engineering org with AI signals", reason)
+
+    def test_missing_dimension_is_not_strong_fit(self):
+        for kw in (dict(prs=50, contributors=1, tools=2),
+                   dict(prs=0, contributors=80, tools=3),
+                   dict(prs=200, contributors=80, tools=0)):
+            score, reason = prospect.fit_score(stats(**kw))
+            self.assertLessEqual(score, 7, kw)
+            self.assertNotIn("active engineering org", reason, kw)
+
+    def test_one_ai_signal_without_activity_is_not_enough_data(self):
+        score, reason = prospect.fit_score(stats(tools=1))
+        self.assertEqual(score, 3)
+        self.assertIn("not enough public data", reason)
+
+    def test_any_activity_evidence_is_enough_data(self):
+        for kw in (dict(prs=1), dict(contributors=5)):
+            self.assertNotIn("not enough public data",
+                             prospect.fit_score(stats(**kw))[1])
+
+    def test_reason_counts_signal_categories_not_tools(self):
+        signals = {"CLAUDE.md": 2, "AGENTS.md": 1, "Cursor": 0}
+        sm = dict(stats(prs=5), ai_signals={"repos_checked": 3, "signals": signals})
+        reason = prospect.fit_score(sm)[1]
+        self.assertIn("2 AI signal categories", reason)
+        self.assertNotIn("tools", reason)
+        self.assertIn("1 AI signal category", prospect.fit_score(stats(prs=5, tools=1))[1])
 
     def test_pr_tier_boundaries(self):
         self.assertEqual([self.score(prs=n) for n in (0, 1, 4, 5, 19, 20, 49, 50)],
