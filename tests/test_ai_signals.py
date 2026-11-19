@@ -20,53 +20,73 @@ def repo(name):
 
 
 def fake_session(present=None, errors=None):
-    """present: {repo name: set of root paths}; errors: {(repo, path): status}."""
+    """present: {repo: {path: kind}}; errors: {(repo, dir): status}."""
     present = present or {}
     errors = errors or {}
     s = mock.Mock()
 
     def get(url, params=None, timeout=None):
         _, rest = url.split("/repos/org/")
-        name, path = rest.split("/contents/")
-        if (name, path) in errors:
-            return resp(errors[(name, path)])
-        return resp(200 if path in present.get(name, set()) else 404)
+        name, directory = rest.split("/contents/")
+        if (name, directory) in errors:
+            return resp(errors[(name, directory)])
+        prefix = f"{directory}/" if directory else ""
+        entries = {}
+        for path, kind in present.get(name, {}).items():
+            if path.startswith(prefix):
+                first, _, tail = path[len(prefix):].partition("/")
+                entries[first] = "dir" if tail else kind
+        if directory and not entries:
+            return resp(404)
+        r = resp(200)
+        r.json.return_value = [
+            {"name": n, "type": k} for n, k in entries.items()
+        ]
+        return r
 
     s.get.side_effect = get
     return s
 
 
+def files(*paths):
+    return {p: "file" for p in paths}
+
+
 class DetectionTests(unittest.TestCase):
-    def counts(self, present, repos=None):
-        repos = repos or [repo(n) for n in present]
+    def counts(self, present):
+        repos = [repo(n) for n in present]
         return prospect.get_ai_signals(fake_session(present), repos)["signals"]
 
     def test_each_signal_detected(self):
         cases = {
-            "CLAUDE.md": "CLAUDE.md",
-            "AGENTS.md": "AGENTS.md",
-            "Cursor": ".cursor",
-            "Copilot instructions": ".github/copilot-instructions.md",
-            "Warp": ".warp",
+            "CLAUDE.md": {"CLAUDE.md": "file"},
+            "AGENTS.md": {"AGENTS.md": "file"},
+            "Cursor": {".cursor/rules": "file"},
+            "Copilot instructions": files(".github/copilot-instructions.md"),
+            "Warp": {".warp/config.yaml": "file"},
         }
-        for signal, path in cases.items():
+        for signal, present in cases.items():
             with self.subTest(signal=signal):
-                counts = self.counts({"a": {path}})
+                counts = self.counts({"a": present})
                 self.assertEqual(counts[signal], 1)
                 self.assertEqual(sum(counts.values()), 1)
 
     def test_cursorrules_alone_counts_as_cursor(self):
-        self.assertEqual(self.counts({"a": {".cursorrules"}})["Cursor"], 1)
+        counts = self.counts({"a": files(".cursorrules")})
+        self.assertEqual(counts["Cursor"], 1)
 
     def test_cursor_counted_once_per_repo(self):
-        counts = self.counts({"a": {".cursor", ".cursorrules"}, "b": {".cursorrules"}})
+        counts = self.counts({
+            "a": {".cursor/rules": "file", ".cursorrules": "file"},
+            "b": files(".cursorrules"),
+        })
         self.assertEqual(counts["Cursor"], 2)
 
     def test_mixed_and_none(self):
         counts = self.counts({
-            "a": {"CLAUDE.md", "AGENTS.md"},
-            "b": {"AGENTS.md", ".warp"},
-            "c": set(),
+            "a": files("CLAUDE.md", "AGENTS.md"),
+            "b": {"AGENTS.md": "file", ".warp/x": "file"},
+            "c": {},
         })
         self.assertEqual(counts["CLAUDE.md"], 1)
         self.assertEqual(counts["AGENTS.md"], 2)
@@ -74,9 +94,19 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(counts["Cursor"], 0)
         self.assertEqual(counts["Copilot instructions"], 0)
 
+    def test_wrong_entry_types_are_not_signals(self):
+        counts = self.counts({
+            "a": files(
+                "CLAUDE.md/x", "AGENTS.md/x", ".cursorrules/x",
+                ".github/copilot-instructions.md/x",
+            ),
+            "b": {".warp": "file", ".cursor": "file"},
+        })
+        self.assertEqual(sum(counts.values()), 0)
+
     def test_only_first_ten_repos_checked(self):
         repos = [repo(f"r{i}") for i in range(12)]
-        present = {f"r{i}": {"AGENTS.md"} for i in range(12)}
+        present = {f"r{i}": files("AGENTS.md") for i in range(12)}
         out = prospect.get_ai_signals(fake_session(present), repos)
         self.assertEqual(out["repos_checked"], 10)
         self.assertEqual(out["signals"]["AGENTS.md"], 10)
@@ -87,26 +117,46 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(zero["repos_checked"], 0)
         self.assertEqual(sum(zero["signals"].values()), 0)
         s.get.assert_not_called()
-        self.assertEqual(prospect.get_ai_signals(s, [repo("a")])["repos_checked"], 1)
+        one = prospect.get_ai_signals(s, [repo("a")])
+        self.assertEqual(one["repos_checked"], 1)
 
-    def test_missing_path_is_not_an_error(self):
-        out = prospect.get_ai_signals(fake_session(), [repo("a")])
+    def test_missing_paths_and_empty_repo_are_not_errors(self):
+        s = fake_session(errors={("a", ""): 404})
+        out = prospect.get_ai_signals(s, [repo("a"), repo("b")])
         self.assertEqual(sum(out["signals"].values()), 0)
 
     def test_non_404_errors_propagate(self):
         for status in (403, 429, 500):
-            with self.subTest(status=status):
-                s = fake_session(errors={("a", "AGENTS.md"): status})
+            with self.subTest(status=status, where="root"):
+                s = fake_session(errors={("a", ""): status})
+                with self.assertRaises(requests.HTTPError):
+                    prospect.get_ai_signals(s, [repo("a")])
+            with self.subTest(status=status, where=".github"):
+                s = fake_session(
+                    present={"a": files(".github/copilot-instructions.md")},
+                    errors={("a", ".github"): status},
+                )
                 with self.assertRaises(requests.HTTPError):
                     prospect.get_ai_signals(s, [repo("a")])
 
-    def test_requests_use_default_branch_root_paths(self):
+    def test_signal_free_repos_use_one_request_each(self):
         s = fake_session()
+        prospect.get_ai_signals(s, [repo(f"r{i}") for i in range(10)])
+        self.assertEqual(s.get.call_count, 10)
+
+    def test_request_budget_stays_within_unauthenticated_limit(self):
+        present = {f"r{i}": files(".github/workflow") for i in range(10)}
+        s = fake_session(present)
+        prospect.get_ai_signals(s, [repo(f"r{i}") for i in range(10)])
+        # org, repo list, then contributors and PRs for each of ten repos
+        base_calls = 2 + 10 * 2
+        self.assertLessEqual(base_calls + s.get.call_count, 60)
+
+    def test_requests_use_default_branch(self):
+        s = fake_session({"a": files(".github/copilot-instructions.md")})
         prospect.get_ai_signals(s, [repo("a")])
-        urls = [c.args[0] for c in s.get.call_args_list]
-        self.assertEqual(len(urls), 6)
-        self.assertTrue(all("ref=" not in u for u in urls))
-        self.assertTrue(all(c.kwargs.get("params") is None for c in s.get.call_args_list))
+        for call in s.get.call_args_list:
+            self.assertIsNone(call.kwargs.get("params"))
 
 
 class ReportTests(unittest.TestCase):
@@ -120,7 +170,8 @@ class ReportTests(unittest.TestCase):
         return buf.getvalue()
 
     def test_lists_found_signals_with_counts(self):
-        ai = {"repos_checked": 10, "signals": {"CLAUDE.md": 3, "AGENTS.md": 0, "Cursor": 1}}
+        signals = {"CLAUDE.md": 3, "AGENTS.md": 0, "Cursor": 1}
+        ai = {"repos_checked": 10, "signals": signals}
         out = self.render(ai)
         self.assertIn("AI coding tool signals (top 10 repos):", out)
         self.assertIn("CLAUDE.md: 3 of 10 repos", out)
@@ -132,7 +183,8 @@ class ReportTests(unittest.TestCase):
         self.assertIn("none found", out)
 
     def test_existing_metrics_unchanged_without_signals(self):
-        sm = prospect.summarize(self.ORG, [], {"active_contributors": 3, "prs_opened_30d": 8})
+        activity = {"active_contributors": 3, "prs_opened_30d": 8}
+        sm = prospect.summarize(self.ORG, [], activity)
         self.assertEqual(sm["active_contributors"], 3)
         self.assertEqual(sm["prs_opened_30d"], 8)
         self.assertEqual(sm["repos_pushed_90d"], 0)

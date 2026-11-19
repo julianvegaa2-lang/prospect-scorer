@@ -20,11 +20,11 @@ PAGE_SIZE = 100
 TOP_REPOS = 10
 PR_WINDOW_DAYS = 30
 AI_SIGNALS = {
-    "CLAUDE.md": ["CLAUDE.md"],
-    "AGENTS.md": ["AGENTS.md"],
-    "Cursor": [".cursor", ".cursorrules"],
-    "Copilot instructions": [".github/copilot-instructions.md"],
-    "Warp": [".warp"],
+    "CLAUDE.md": [("file", "CLAUDE.md")],
+    "AGENTS.md": [("file", "AGENTS.md")],
+    "Cursor": [("dir", ".cursor"), ("file", ".cursorrules")],
+    "Copilot instructions": [("file", ".github/copilot-instructions.md")],
+    "Warp": [("dir", ".warp")],
 }
 
 
@@ -111,22 +111,41 @@ def get_activity(s, repos, cutoff):
     return {"active_contributors": len(contributors), "prs_opened_30d": prs}
 
 
-def path_exists(s, repo, path):
-    """True if path exists at the root of the default branch; 404 means absent."""
+def list_entry_types(s, repo, path=""):
+    """Map of entry name to type for a directory on the default branch.
+
+    A 404 means the directory is absent (or the repo is empty) and yields {}.
+    """
     r = s.get(f"{API}/repos/{repo['full_name']}/contents/{path}", timeout=15)
     if r.status_code == 404:
-        return False
+        return {}
     r.raise_for_status()
-    return True
+    entries = r.json()
+    if not isinstance(entries, list):
+        return {}
+    return {e["name"]: e["type"] for e in entries}
+
+
+def has_signal_path(s, repo, root, kind, path):
+    parent, _, name = path.rpartition("/")
+    if parent:
+        if root.get(parent) != "dir":
+            return False
+        entries = list_entry_types(s, repo, parent)
+    else:
+        entries = root
+    return entries.get(name) == kind
 
 
 def get_ai_signals(s, repos):
-    """Repos, among the top repos by recent push, that contain each AI tool signal."""
+    """Per-signal count of top repos by recent push that contain the signal."""
     top = repos[:TOP_REPOS]
     counts = {name: 0 for name in AI_SIGNALS}
     for repo in top:
+        root = list_entry_types(s, repo)
         for name, paths in AI_SIGNALS.items():
-            if any(path_exists(s, repo, p) for p in paths):
+            if any(has_signal_path(s, repo, root, kind, p)
+                   for kind, p in paths):
                 counts[name] += 1
     return {"repos_checked": len(top), "signals": counts}
 
