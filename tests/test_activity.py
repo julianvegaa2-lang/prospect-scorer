@@ -233,7 +233,7 @@ class FitScoreTests(unittest.TestCase):
         self.assertIn("active engineering org with AI signals", reason)
 
     def test_missing_dimension_is_not_strong_fit(self):
-        for kw in (dict(prs=50, contributors=1, ai_repos=3),
+        for kw in (dict(prs=200, contributors=1, ai_repos=3),
                    dict(prs=0, contributors=80, ai_repos=3),
                    dict(prs=200, contributors=80, ai_repos=0)):
             score, reason = prospect.fit_score(stats(**kw))
@@ -268,6 +268,21 @@ class FitScoreTests(unittest.TestCase):
     def test_ai_coverage_tier_boundaries(self):
         self.assertEqual([self.score(prs=5, ai_repos=n) for n in range(0, 5)],
                          [2, 3, 4, 5, 5])
+
+    def test_missing_contributors_cap_is_seven_without_strong_wording(self):
+        score, reason = prospect.fit_score(stats(prs=200, contributors=1, ai_repos=3))
+        self.assertEqual(score, 7)
+        self.assertNotIn("active engineering org", reason)
+
+    def test_ai_points_use_sample_percentage_not_repo_count(self):
+        warp = dict(prs=543, contributors=191, repos=52)
+        cases = [(1, 10, 8), (1, 5, 9), (1, 2, 10), (0, 0, 7)]
+        for with_signal, checked, expected in cases:
+            sm = stats(**warp)
+            sm["ai_signals"] = {"repos_checked": checked,
+                                "repos_with_signal": with_signal, "signals": {}}
+            self.assertEqual(prospect.fit_score(sm)[0], expected,
+                             (with_signal, checked))
 
     def test_ai_points_follow_repo_coverage_not_category_count(self):
         one = prospect.fit_score(stats(prs=5, ai_repos=1))
