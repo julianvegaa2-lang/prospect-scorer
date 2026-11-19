@@ -69,41 +69,102 @@ class ContributorTests(unittest.TestCase):
         self.assertEqual(out, {"active_contributors": 0})
 
 
-def search_session(prs, repos, incomplete=False):
-    """Answer the two org-wide search calls with fixed totals."""
+def search_session(prs, repos, incomplete=()):
+    """Answer the org-wide search calls with fixed totals.
+
+    `incomplete` names the endpoints ("issues", "repositories") that report
+    incomplete results on every attempt.
+    """
     s = mock.Mock()
     totals = {"issues": prs, "repositories": repos}
 
     def get(url, params=None, timeout=None):
-        return resp({"total_count": totals[url.rsplit("/", 1)[1]],
-                     "incomplete_results": incomplete})
+        kind = url.rsplit("/", 1)[1]
+        return resp({"total_count": totals[kind],
+                     "incomplete_results": kind in incomplete})
 
     s.get.side_effect = get
     return s
 
 
+def queries(s):
+    return {c.args[0].rsplit("/", 1)[1]: c.kwargs["params"]["q"]
+            for c in s.get.call_args_list}
+
+
 class OrgActivityTests(unittest.TestCase):
-    def test_counts_org_wide_prs_and_maintained_repos(self):
+    def test_counts_prs_and_repos_over_the_same_population(self):
         s = search_session(prs=42, repos=7)
-        out = prospect.get_org_activity(s, "acme", CUTOFF)
-        self.assertEqual(out, {"prs_opened_30d": 42, "maintained_repos": 7,
-                               "org_counts_complete": True})
-        queries = {c.args[0].rsplit("/", 1)[1]: c.kwargs["params"]["q"]
-                   for c in s.get.call_args_list}
-        self.assertEqual(queries["issues"],
-                         "org:acme is:pr is:public created:>=2026-01-01")
-        self.assertEqual(queries["repositories"],
-                         "org:acme is:public fork:false archived:false")
+        out = prospect.get_org_activity(s, "acme", CUTOFF, 7)
+        self.assertEqual(out, {"prs_opened_30d": 42, "scoped_repos": 7,
+                               "count_limits": []})
+        q = queries(s)
+        self.assertEqual(q["issues"], "org:acme is:pr is:public archived:false "
+                                      "created:>=2026-01-01T00:00:00Z")
+        self.assertEqual(q["repositories"], "org:acme is:public archived:false")
 
-    def test_incomplete_search_is_flagged(self):
-        out = prospect.get_org_activity(search_session(1, 1, incomplete=True),
-                                        "acme", CUTOFF)
-        self.assertFalse(out["org_counts_complete"])
+    def test_cutoff_keeps_time_of_day(self):
+        s = search_session(1, 1)
+        cutoff = datetime(2026, 1, 1, 13, 45, 7, tzinfo=timezone.utc)
+        prospect.get_org_activity(s, "acme", cutoff, 1)
+        self.assertIn("created:>=2026-01-01T13:45:07Z", queries(s)["issues"])
 
-    def test_maintained_drops_forks_and_archives(self):
-        repos = [{"name": "a"}, {"name": "b", "fork": True},
-                 {"name": "c", "archived": True}]
-        self.assertEqual(prospect.maintained(repos), [{"name": "a"}])
+    def test_incomplete_search_is_retried_then_recovers(self):
+        s = mock.Mock()
+        s.get.side_effect = [
+            resp({"total_count": 3, "incomplete_results": True}),
+            resp({"total_count": 9, "incomplete_results": False}),
+            resp({"total_count": 4, "incomplete_results": False}),
+        ]
+        out = prospect.get_org_activity(s, "acme", CUTOFF, 4)
+        self.assertEqual((out["prs_opened_30d"], out["scoped_repos"]), (9, 4))
+        self.assertEqual(out["count_limits"], [])
+
+    def test_persistent_incomplete_search_is_reported_per_endpoint(self):
+        for kind, text in (("issues", "PR search"), ("repositories", "repo search")):
+            out = prospect.get_org_activity(
+                search_session(5, 5, incomplete=(kind,)), "acme", CUTOFF, 5)
+            self.assertEqual(len(out["count_limits"]), 1, kind)
+            self.assertIn(text, out["count_limits"][0])
+
+    def test_org_beyond_search_scope_is_reported(self):
+        out = prospect.get_org_activity(search_session(5, 5), "acme", CUTOFF, 4001)
+        self.assertEqual(len(out["count_limits"]), 1)
+        self.assertIn("4000", out["count_limits"][0])
+        ok = prospect.get_org_activity(search_session(5, 5), "acme", CUTOFF, 4000)
+        self.assertEqual(ok["count_limits"], [])
+
+
+def repos_page(names, **flags):
+    return resp([dict({"full_name": f"org/{n}"}, **flags) for n in names])
+
+
+class SampleReposTests(unittest.TestCase):
+    def session(self, pages):
+        s = mock.Mock()
+        s.get.side_effect = lambda url, params=None, timeout=None: (
+            pages[params["page"] - 1] if params["page"] <= len(pages) else resp([]))
+        return s
+
+    def test_skips_forks_and_archives_across_pages(self):
+        page1 = resp([{"full_name": f"org/f{i}", "fork": True} for i in range(100)])
+        page2 = resp([{"full_name": "org/old", "archived": True}]
+                     + [{"full_name": f"org/r{i}"} for i in range(12)])
+        s = self.session([page1, page2])
+        out = prospect.get_sample_repos(s, "org")
+        self.assertEqual([r["full_name"] for r in out], [f"org/r{i}" for i in range(10)])
+        self.assertEqual(s.get.call_count, 2)
+
+    def test_stops_when_org_has_fewer_than_ten(self):
+        s = self.session([repos_page(["a", "b"])])
+        self.assertEqual(len(prospect.get_sample_repos(s, "org")), 2)
+        self.assertEqual(s.get.call_count, 1)
+
+    def test_page_cap_bounds_requests(self):
+        forks = resp([{"full_name": "org/f", "fork": True}] * 100)
+        s = self.session([forks] * 50)
+        self.assertEqual(prospect.get_sample_repos(s, "org"), [])
+        self.assertEqual(s.get.call_count, prospect.SAMPLE_MAX_PAGES)
 
 
 class SummaryAndReportTests(unittest.TestCase):
@@ -114,13 +175,13 @@ class SummaryAndReportTests(unittest.TestCase):
     ]
 
     def test_existing_metrics_unchanged(self):
-        sm = prospect.summarize(self.ORG, self.REPOS, {"active_contributors": 3, "prs_opened_30d": 8, "maintained_repos": 4})
+        sm = prospect.summarize(self.ORG, self.REPOS, {"active_contributors": 3, "prs_opened_30d": 8, "scoped_repos": 4})
         self.assertEqual(sm["repos_pushed_90d"], 1)
         self.assertEqual(sm["stars_on_active"], 4)
         self.assertEqual(sm["top_languages"], [("Go", 1)])
         self.assertEqual(sm["active_contributors"], 3)
         self.assertEqual(sm["prs_opened_30d"], 8)
-        self.assertEqual(sm["maintained_repos"], 4)
+        self.assertEqual(sm["scoped_repos"], 4)
 
     def test_report_labels(self):
         sm = prospect.summarize(self.ORG, self.REPOS, {"active_contributors": 3, "prs_opened_30d": 0})
@@ -130,25 +191,26 @@ class SummaryAndReportTests(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("Active contributors:     3", out)
         self.assertIn("PRs opened last 30d:     0", out)
-        self.assertIn("Maintained repos:        0", out)
+        self.assertIn("Non-archived repos:      0", out)
         self.assertIn("Data limits:", out)
-        self.assertNotIn("incomplete", out)
+        self.assertNotIn("WARNING", out)
 
-    def test_report_warns_on_incomplete_counts(self):
-        sm = prospect.summarize(self.ORG, self.REPOS, {"org_counts_complete": False})
+    def test_report_warns_on_unreliable_counts(self):
+        sm = prospect.summarize(self.ORG, self.REPOS, {"count_limits": ["PR search stayed incomplete"]})
         buf = io.StringIO()
         with redirect_stdout(buf):
             prospect.print_report(sm)
-        self.assertIn("incomplete results", buf.getvalue())
+        self.assertIn("WARNING: PR search stayed incomplete.", buf.getvalue())
 
 
-def stats(prs=0, contributors=0, tools=0, repos=1):
+def stats(prs=0, contributors=0, tools=0, repos=1, limits=None):
     names = ["CLAUDE.md", "AGENTS.md", "Cursor", "Warp"]
     signals = {n: (3 if i < tools else 0) for i, n in enumerate(names)}
     return {
         "prs_opened_30d": prs,
         "active_contributors": contributors,
-        "maintained_repos": repos,
+        "scoped_repos": repos,
+        "count_limits": limits or [],
         "ai_signals": {"repos_checked": 10, "signals": signals},
     }
 
@@ -211,7 +273,7 @@ class FitScoreTests(unittest.TestCase):
             self.assertLessEqual(score, 4, prs)
             self.assertIn("low recent PR activity relative to org size", reason)
             self.assertNotIn("active engineering org", reason)
-            self.assertIn("across 1000 maintained repos", reason)
+            self.assertIn("across 1000 non-archived repos", reason)
 
     def test_small_active_org_scores_as_strong_fit(self):
         score, reason = prospect.fit_score(
@@ -230,7 +292,16 @@ class FitScoreTests(unittest.TestCase):
         self.assertEqual([self.score(prs=50, repos=n) for n in (50, 100, 250, 1000, 1001)],
                          [5, 4, 3, 2, 1])
 
-    def test_zero_maintained_repos_does_not_divide_by_zero(self):
+    def test_unreliable_counts_withhold_definitive_score(self):
+        for repos in (10, 1000):
+            score, reason = prospect.fit_score(stats(
+                prs=50, contributors=30, tools=2, repos=repos,
+                limits=["repo search stayed incomplete, so the repo count may be low"]))
+            self.assertLessEqual(score, prospect.PROVISIONAL_MAX_SCORE)
+            self.assertIn("provisional", reason)
+            self.assertNotIn("active engineering org", reason)
+
+    def test_zero_scoped_repos_does_not_divide_by_zero(self):
         self.assertIn(self.score(prs=5, repos=0), range(1, 11))
 
     def test_score_never_decreases_with_more_evidence(self):

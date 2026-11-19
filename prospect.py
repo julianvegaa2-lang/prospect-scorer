@@ -19,6 +19,9 @@ API = "https://api.github.com"
 PAGE_SIZE = 100
 TOP_REPOS = 10
 PR_WINDOW_DAYS = 30
+SAMPLE_MAX_PAGES = 10
+# A score with unreliable counts stays mid-range: never strong-fit, never bottom.
+PROVISIONAL_MAX_SCORE = 5
 AI_SIGNALS = {
     "CLAUDE.md": [("file", "CLAUDE.md")],
     "AGENTS.md": [("file", "AGENTS.md")],
@@ -73,30 +76,46 @@ def get_contributor_ids(s, repo):
         page += 1
 
 
+SEARCH_ATTEMPTS = 3
+SEARCH_REPO_SCOPE_LIMIT = 4000
+
+
 def search_total(s, path, query):
-    """Total matches and completeness flag for a GitHub search query."""
-    r = s.get(f"{API}/search/{path}", params={"q": query, "per_page": 1}, timeout=15)
-    r.raise_for_status()
-    body = r.json()
-    return body["total_count"], not body.get("incomplete_results", False)
+    """(total matches, complete) for a GitHub search query.
 
-
-def get_org_activity(s, org, cutoff):
-    """Org-wide recent PRs and maintained repo count, measured the same way.
-
-    Both numbers cover every public repo of the org. Maintained repos exclude
-    forks and archived repos, which are not a sign of an active team.
+    Retries when GitHub reports incomplete results; complete is False if every
+    attempt was incomplete, in which case the total can be too low.
     """
-    since = cutoff.date().isoformat()
+    for _ in range(SEARCH_ATTEMPTS):
+        r = s.get(f"{API}/search/{path}", params={"q": query, "per_page": 1}, timeout=15)
+        r.raise_for_status()
+        body = r.json()
+        if not body.get("incomplete_results"):
+            return body["total_count"], True
+    return body["total_count"], False
+
+
+def get_org_activity(s, org, cutoff, org_public_repos):
+    """Org-wide recent PRs and in-scope repo count, over the same repos.
+
+    Scope is every public, non-archived repo of the org, forks included: issue
+    search cannot exclude forks, so the repo count cannot either. `count_limits`
+    lists reasons the counts cannot be trusted.
+    """
+    since = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    limits = []
     prs, prs_complete = search_total(
-        s, "issues", f"org:{org} is:pr is:public created:>={since}")
+        s, "issues", f"org:{org} is:pr is:public archived:false created:>={since}")
     repos, repos_complete = search_total(
-        s, "repositories", f"org:{org} is:public fork:false archived:false")
-    return {
-        "prs_opened_30d": prs,
-        "maintained_repos": repos,
-        "org_counts_complete": prs_complete and repos_complete,
-    }
+        s, "repositories", f"org:{org} is:public archived:false")
+    if not prs_complete:
+        limits.append("PR search stayed incomplete, so the PR count may be low")
+    if not repos_complete:
+        limits.append("repo search stayed incomplete, so the repo count may be low")
+    if org_public_repos > SEARCH_REPO_SCOPE_LIMIT:
+        limits.append(f"org has more than {SEARCH_REPO_SCOPE_LIMIT} public repos, "
+                      "beyond what GitHub issue search covers")
+    return {"prs_opened_30d": prs, "scoped_repos": repos, "count_limits": limits}
 
 
 def get_activity(s, repos):
@@ -107,8 +126,22 @@ def get_activity(s, repos):
     return {"active_contributors": len(contributors)}
 
 
-def maintained(repos):
-    return [r for r in repos if not r.get("fork") and not r.get("archived")]
+def get_sample_repos(s, org):
+    """The TOP_REPOS most recently pushed public repos that are not forks or archived."""
+    sample = []
+    for page in range(1, SAMPLE_MAX_PAGES + 1):
+        r = s.get(
+            f"{API}/orgs/{org}/repos",
+            params={"sort": "pushed", "direction": "desc", "per_page": PAGE_SIZE,
+                    "page": page, "type": "public"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        repos = r.json()
+        sample += [x for x in repos if not x.get("fork") and not x.get("archived")]
+        if len(sample) >= TOP_REPOS or len(repos) < PAGE_SIZE:
+            break
+    return sample[:TOP_REPOS]
 
 
 def list_entry_types(s, repo, path=""):
@@ -174,8 +207,8 @@ def summarize(org_info, repos, activity=None, ai_signals=None):
         "top_languages": languages.most_common(5),
         "active_contributors": activity.get("active_contributors", 0),
         "prs_opened_30d": activity.get("prs_opened_30d", 0),
-        "maintained_repos": activity.get("maintained_repos", 0),
-        "org_counts_complete": activity.get("org_counts_complete", True),
+        "scoped_repos": activity.get("scoped_repos", 0),
+        "count_limits": activity.get("count_limits", []),
         "ai_signals": ai_signals,
     }
 
@@ -189,7 +222,7 @@ def fit_score(sm):
     """
     prs = sm["prs_opened_30d"]
     contributors = sm["active_contributors"]
-    repos = max(sm["maintained_repos"], 1)
+    repos = max(sm["scoped_repos"], 1)
     prs_per_repo = prs / repos
     # Signal categories are file conventions (for example the tool-neutral
     # AGENTS.md), not a count of distinct tools.
@@ -201,7 +234,7 @@ def fit_score(sm):
     #
     # Recent PRs weigh the most: they show a team shipping code now. Points are
     # the lower of two readings: PR volume (a one-repo org with one PR is not
-    # a team) and PRs per maintained repo in 30d (a huge org with a trickle of
+    # a team) and PRs per in-scope repo in 30d (a huge org with a trickle of
     # PRs is mostly dormant).
     pr_tiers = [(50, 4), (20, 3), (5, 2), (1, 1)]
     density_tiers = [(1.0, 4), (0.5, 3), (0.2, 2), (0.05, 1)]
@@ -227,11 +260,15 @@ def fit_score(sm):
         score = min(score, 7)
 
     plural = "y" if signals == 1 else "ies"
-    facts = (f"{prs} PRs in 30d across {sm['maintained_repos']} maintained "
+    facts = (f"{prs} PRs in 30d across {sm['scoped_repos']} non-archived "
              f"repos ({prs_per_repo:.2f} per repo), {contributors} contributors, "
              f"{signals} AI signal categor{plural} in public repos")
     # Sufficiency depends on activity evidence only: AI files alone cannot show
     # an active engineering org.
+    if sm["count_limits"]:
+        # Undercounted PRs or repos skew the density, so no definitive score.
+        score = min(score, PROVISIONAL_MAX_SCORE)
+        return score, f"provisional, counts not reliable: {'; '.join(sm['count_limits'])} ({facts})"
     if not prs and not contributors:
         return score, f"not enough public data to judge ({facts})"
     if not pr_points:
@@ -249,7 +286,7 @@ def print_report(sm):
     print(f"Repos pushed last 90d:   {sm['repos_pushed_90d']}")
     print(f"Stars on active repos:   {sm['stars_on_active']}")
     print(f"Active contributors:     {sm['active_contributors']}")
-    print(f"Maintained repos:        {sm['maintained_repos']}")
+    print(f"Non-archived repos:      {sm['scoped_repos']}")
     print(f"PRs opened last 30d:     {sm['prs_opened_30d']}")
     langs = ", ".join(f"{l} ({n})" for l, n in sm["top_languages"]) or "n/a"
     print(f"Top languages (active):  {langs}")
@@ -261,11 +298,11 @@ def print_report(sm):
             print(f"  {name}: {count} of {ai['repos_checked']} repos")
     else:
         print("  none found")
-    print("Data limits: PRs and maintained repos (public, non-fork, non-archived)")
-    print(f"  are org-wide; contributors and AI signals sample the {TOP_REPOS} most")
-    print("  recently pushed maintained repos. Private repos are not visible.")
-    if not sm["org_counts_complete"]:
-        print("  GitHub search reported incomplete results: counts may be low.")
+    print("Data limits: PRs and non-archived repos (public, forks included) are")
+    print(f"  org-wide; contributors and AI signals sample the {TOP_REPOS} most recently")
+    print("  pushed non-fork, non-archived repos. Private repos are not visible.")
+    for limit in sm["count_limits"]:
+        print(f"  WARNING: {limit}.")
     score, reason = fit_score(sm)
     print()
     print(f"Fit: {score}/10 ({reason})")
@@ -280,10 +317,11 @@ def main():
     try:
         org_info = get_org(s, org)
         repos = get_recent_repos(s, org)
+        sample = get_sample_repos(s, org)
         pr_cutoff = datetime.now(timezone.utc) - timedelta(days=PR_WINDOW_DAYS)
-        sample = maintained(repos)
         activity = {**get_activity(s, sample),
-                    **get_org_activity(s, org, pr_cutoff)}
+                    **get_org_activity(s, org, pr_cutoff,
+                                       org_info.get("public_repos", 0))}
         ai_signals = get_ai_signals(s, sample)
     except requests.HTTPError as e:
         print(f"GitHub error for '{org}': {e}")
