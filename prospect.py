@@ -73,42 +73,42 @@ def get_contributor_ids(s, repo):
         page += 1
 
 
-def count_recent_prs(s, repo, cutoff):
-    """PRs in any state created at or after cutoff, newest first, all pages needed."""
-    count = 0
-    page = 1
-    while True:
-        r = s.get(
-            f"{API}/repos/{repo['full_name']}/pulls",
-            params={
-                "state": "all",
-                "sort": "created",
-                "direction": "desc",
-                "per_page": PAGE_SIZE,
-                "page": page,
-            },
-            timeout=15,
-        )
-        r.raise_for_status()
-        pulls = r.json()
-        for pr in pulls:
-            if parse_time(pr["created_at"]) < cutoff:
-                return count
-            count += 1
-        if len(pulls) < PAGE_SIZE:
-            return count
-        page += 1
+def search_total(s, path, query):
+    """Total matches and completeness flag for a GitHub search query."""
+    r = s.get(f"{API}/search/{path}", params={"q": query, "per_page": 1}, timeout=15)
+    r.raise_for_status()
+    body = r.json()
+    return body["total_count"], not body.get("incomplete_results", False)
 
 
-def get_activity(s, repos, cutoff):
-    """Unique contributors and recent PRs across the top repos by recent push."""
-    top = repos[:TOP_REPOS]
+def get_org_activity(s, org, cutoff):
+    """Org-wide recent PRs and maintained repo count, measured the same way.
+
+    Both numbers cover every public repo of the org. Maintained repos exclude
+    forks and archived repos, which are not a sign of an active team.
+    """
+    since = cutoff.date().isoformat()
+    prs, prs_complete = search_total(
+        s, "issues", f"org:{org} is:pr is:public created:>={since}")
+    repos, repos_complete = search_total(
+        s, "repositories", f"org:{org} is:public fork:false archived:false")
+    return {
+        "prs_opened_30d": prs,
+        "maintained_repos": repos,
+        "org_counts_complete": prs_complete and repos_complete,
+    }
+
+
+def get_activity(s, repos):
+    """Unique all-time contributors across the top repos by recent push."""
     contributors = set()
-    prs = 0
-    for repo in top:
+    for repo in repos[:TOP_REPOS]:
         contributors |= get_contributor_ids(s, repo)
-        prs += count_recent_prs(s, repo, cutoff)
-    return {"active_contributors": len(contributors), "prs_opened_30d": prs}
+    return {"active_contributors": len(contributors)}
+
+
+def maintained(repos):
+    return [r for r in repos if not r.get("fork") and not r.get("archived")]
 
 
 def list_entry_types(s, repo, path=""):
@@ -174,6 +174,8 @@ def summarize(org_info, repos, activity=None, ai_signals=None):
         "top_languages": languages.most_common(5),
         "active_contributors": activity.get("active_contributors", 0),
         "prs_opened_30d": activity.get("prs_opened_30d", 0),
+        "maintained_repos": activity.get("maintained_repos", 0),
+        "org_counts_complete": activity.get("org_counts_complete", True),
         "ai_signals": ai_signals,
     }
 
@@ -187,18 +189,24 @@ def fit_score(sm):
     """
     prs = sm["prs_opened_30d"]
     contributors = sm["active_contributors"]
+    repos = max(sm["maintained_repos"], 1)
+    prs_per_repo = prs / repos
     # Signal categories are file conventions (for example the tool-neutral
     # AGENTS.md), not a count of distinct tools.
     signals = sum(1 for c in sm["ai_signals"]["signals"].values() if c)
 
     # Weights: 1 (floor) + up to 9 points of evidence. Each tier list holds
     # (minimum value, points), highest tier first. Org popularity (followers,
-    # stars, repo count) is deliberately not scored.
+    # stars, total repo count) is deliberately not scored.
     #
-    # Recent PRs weigh the most: they show a team shipping code now.
+    # Recent PRs weigh the most: they show a team shipping code now. Points are
+    # the lower of two readings: PR volume (a one-repo org with one PR is not
+    # a team) and PRs per maintained repo in 30d (a huge org with a trickle of
+    # PRs is mostly dormant).
     pr_tiers = [(50, 4), (20, 3), (5, 2), (1, 1)]
+    density_tiers = [(1.0, 4), (0.5, 3), (0.2, 2), (0.05, 1)]
     # Contributor breadth shows a team, not a solo maintainer. It is all-time,
-    # so it weighs less than recent PRs.
+    # so it counts only when recent PRs score, and weighs less than them.
     contributor_tiers = [(20, 2), (5, 1)]
     # Detected AI signal categories in public repos: one is a clear sign of use
     # and a second adds a little more. More files add no more proof.
@@ -207,8 +215,8 @@ def fit_score(sm):
     def points(value, tiers):
         return next((p for minimum, p in tiers if value >= minimum), 0)
 
-    pr_points = points(prs, pr_tiers)
-    contributor_points = points(contributors, contributor_tiers)
+    pr_points = min(points(prs, pr_tiers), points(prs_per_repo, density_tiers))
+    contributor_points = points(contributors, contributor_tiers) if pr_points else 0
     ai_points = points(signals, ai_tiers)
     score = 1 + pr_points + contributor_points + ai_points
 
@@ -219,12 +227,15 @@ def fit_score(sm):
         score = min(score, 7)
 
     plural = "y" if signals == 1 else "ies"
-    facts = (f"{prs} PRs in 30d, {contributors} contributors, "
+    facts = (f"{prs} PRs in 30d across {sm['maintained_repos']} maintained "
+             f"repos ({prs_per_repo:.2f} per repo), {contributors} contributors, "
              f"{signals} AI signal categor{plural} in public repos")
     # Sufficiency depends on activity evidence only: AI files alone cannot show
     # an active engineering org.
-    if not pr_points and not contributor_points:
+    if not prs and not contributors:
         return score, f"not enough public data to judge ({facts})"
+    if not pr_points:
+        return score, f"low recent PR activity relative to org size ({facts})"
     if strong and score >= 8:
         return score, f"active engineering org with AI signals ({facts})"
     return score, facts
@@ -238,6 +249,7 @@ def print_report(sm):
     print(f"Repos pushed last 90d:   {sm['repos_pushed_90d']}")
     print(f"Stars on active repos:   {sm['stars_on_active']}")
     print(f"Active contributors:     {sm['active_contributors']}")
+    print(f"Maintained repos:        {sm['maintained_repos']}")
     print(f"PRs opened last 30d:     {sm['prs_opened_30d']}")
     langs = ", ".join(f"{l} ({n})" for l, n in sm["top_languages"]) or "n/a"
     print(f"Top languages (active):  {langs}")
@@ -249,6 +261,11 @@ def print_report(sm):
             print(f"  {name}: {count} of {ai['repos_checked']} repos")
     else:
         print("  none found")
+    print("Data limits: PRs and maintained repos (public, non-fork, non-archived)")
+    print(f"  are org-wide; contributors and AI signals sample the {TOP_REPOS} most")
+    print("  recently pushed maintained repos. Private repos are not visible.")
+    if not sm["org_counts_complete"]:
+        print("  GitHub search reported incomplete results: counts may be low.")
     score, reason = fit_score(sm)
     print()
     print(f"Fit: {score}/10 ({reason})")
@@ -264,8 +281,10 @@ def main():
         org_info = get_org(s, org)
         repos = get_recent_repos(s, org)
         pr_cutoff = datetime.now(timezone.utc) - timedelta(days=PR_WINDOW_DAYS)
-        activity = get_activity(s, repos, pr_cutoff)
-        ai_signals = get_ai_signals(s, repos)
+        sample = maintained(repos)
+        activity = {**get_activity(s, sample),
+                    **get_org_activity(s, org, pr_cutoff)}
+        ai_signals = get_ai_signals(s, sample)
     except requests.HTTPError as e:
         print(f"GitHub error for '{org}': {e}")
         sys.exit(2)
